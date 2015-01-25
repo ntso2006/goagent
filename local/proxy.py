@@ -621,76 +621,6 @@ class PHPFetchPlugin(BaseFetchPlugin):
             del data
 
 
-class VPSServer(gevent.server.StreamServer):
-    """vps server"""
-    net2 = Net2()
-
-    def __init__(self, *args, **kwargs):
-        self.remote_addr = kwargs.pop('remote')
-        self.remote_password = kwargs.pop('password')
-        gevent.server.StreamServer.__init__(self, *args, **kwargs)
-
-    def forward_socket(self, local, remote, timeout, bufsize):
-        """forward socket"""
-        tick = 1
-        count = timeout
-        while 1:
-            count -= tick
-            if count <= 0:
-                break
-            ins, _, errors = select.select([local, remote], [], [local, remote], tick)
-            if remote in errors:
-                local.close()
-                remote.close()
-                return
-            if local in errors:
-                local.close()
-                remote.close()
-                return
-            if remote in ins:
-                data = remote.recv(bufsize)
-                if not data:
-                    remote.close()
-                    local.close()
-                    return
-                local.sendall(data)
-            if local in ins:
-                data = local.recv(bufsize)
-                if not data:
-                    remote.close()
-                    local.close()
-                    return
-                remote.sendall(data)
-            if ins:
-                count = timeout
-
-    def handle(self, sock, addr):
-        request_data = data = ''
-        while True:
-            data = sock.recv(8192)
-            request_data += data
-            if '\r\n' in data:
-                break
-            if data == '':
-                return
-        request_line, _, header_data = request_data.partition('\r\n')
-        logging.info('%s:%d "VPS %s" - -', addr[0], addr[1], request_line)
-        host, port = self.remote_addr.rsplit(':')
-        remote = self.net2.create_tcp_connection(host.strip('[]'), int(port), 8, cache_key=self.remote_addr)
-        seed = os.urandom(4)
-        logging.info('current seed %r', seed)
-        remote.send(seed)
-        remote = RC4Socket(remote, hmac.new(self.remote_password, seed).digest())
-        remote.sendall(request_data)
-        try:
-            self.forward_socket(sock, remote, 60, bufsize=256*1024)
-        except (socket.error, ssl.SSLError, OpenSSL.SSL.Error) as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.ENOTCONN, errno.EPIPE):
-                raise
-            if e.args[0] in (errno.EBADF,):
-                return
-
-
 class GAEFetchFilter(BaseProxyHandlerFilter):
     """gae fetch filter"""
     #https://github.com/AppScale/gae_sdk/blob/master/google/appengine/api/taskqueue/taskqueue.py#L241
@@ -848,6 +778,88 @@ class PHPProxyHandler(SimpleProxyHandler):
             net2.add_iplist_alias('php_fetchserver', common.PHP_HOSTS)
             net2.add_fixed_iplist(common.PHP_HOSTS)
             net2.add_rule(hostname, 'php_fetchserver')
+            net2.enable_connection_cache()
+            if common.PHP_KEEPALIVE:
+                net2.enable_connection_keepalive()
+            net2.enable_openssl_session_cache()
+            self.__class__.net2 = net2
+
+
+class VPSFetchPlugin(BaseFetchPlugin):
+    """vps fetch plugin"""
+
+    def __init__(self, fetchservers):
+        BaseFetchPlugin.__init__(self)
+        self.fetchservers = fetchservers
+
+    def handle(self, handler, **kwargs):
+        method = handler.command
+        url = handler.path
+        headers = dict((k.title(), v) for k, v in handler.headers.items())
+        body = handler.body
+        if body:
+            if len(body) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
+                zbody = deflate(body)
+                if len(zbody) < len(body):
+                    body = zbody
+                    headers['Content-Encoding'] = 'deflate'
+            headers['Content-Length'] = str(len(body))
+        skip_headers = handler.net2.skip_headers
+        if self.password:
+            kwargs['password'] = self.password
+        if self.validate:
+            kwargs['validate'] = self.validate
+        payload = '%s %s %s\r\n' % (method, url, handler.request_version)
+        payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items() if k not in handler.net2.skip_headers)
+        payload += ''.join('X-URLFETCH-%s: %s\r\n' % (k, v) for k, v in kwargs.items() if v)
+        payload = deflate(payload)
+        body = '%s%s%s' % ((struct.pack('!h', len(payload)), payload, body))
+        request_headers = {'Content-Length': len(body), 'Content-Type': 'application/octet-stream'}
+        fetchserver_index = 0 if 'Range' not in headers else random.randint(0, len(self.fetchservers)-1)
+        fetchserver = '%s?%s' % (self.fetchservers[fetchserver_index], random.random())
+        crlf = 0
+        cache_key = '%s//:%s' % urlparse.urlsplit(fetchserver)[:2]
+        try:
+            response = handler.net2.create_http_request('POST', fetchserver, request_headers, body, handler.net2.connect_timeout, crlf=crlf, cache_key=cache_key)
+        except Exception as e:
+            logging.warning('%s "%s" failed %r', method, url, e)
+            return
+        response.app_status = response.status
+        need_decrypt = self.password and response.app_status == 200 and response.getheader('Content-Type', '') == 'image/gif' and response.fp
+        if need_decrypt:
+            response.fp = CipherFileObject(response.fp, XORCipher(self.password[0]))
+        logging.info('%s "PHP %s %s %s" %s %s', handler.address_string(), handler.command, url, handler.protocol_version, response.status, response.getheader('Content-Length', '-'))
+        handler.close_connection = bool(response.getheader('Transfer-Encoding'))
+        while True:
+            data = response.read(8192)
+            if not data:
+                break
+            handler.wfile.write(data)
+            del data
+
+
+class VPSFetchFilter(BaseProxyHandlerFilter):
+    """vps fetch filter"""
+    def filter(self, handler):
+        return 'vps', {}
+
+
+class VPSProxyHandler(SimpleProxyHandler):
+    """VPS Proxy Handler"""
+    handler_filters = [PHPFetchFilter()]
+    handler_plugins = {'direct': DirectFetchPlugin(),
+                       'mock': MockFetchPlugin(),}
+
+    def __init__(self, *args, **kwargs):
+        SimpleProxyHandler.__init__(self, *args, **kwargs)
+
+    def first_run(self):
+        """VPSProxyHandler setup, init domain/iplist map"""
+        if not common.PROXY_ENABLE:
+            hostname = urlparse.urlsplit(common.PHP_FETCHSERVER).hostname
+            net2 = AdvancedNet2(window=4, ssl_version='TLSv1', dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
+            if not common.PHP_HOSTS:
+                common.PHP_HOSTS = net2.gethostsbyname(hostname)
             net2.enable_connection_cache()
             if common.PHP_KEEPALIVE:
                 net2.enable_connection_keepalive()
@@ -1377,8 +1389,7 @@ class Common(object):
 
         self.VPS_ENABLE = self.CONFIG.getint('vps', 'enable')
         self.VPS_LISTEN = self.CONFIG.get('vps', 'listen')
-        self.VPS_REMOTE = self.CONFIG.get('vps', 'remote')
-        self.VPS_PASSWORD = self.CONFIG.get('vps', 'password')
+        self.VPS_SERVERS = self.CONFIG.get('vps', 'servers').split('|')
 
         self.PROXY_ENABLE = self.CONFIG.getint('proxy', 'enable')
         self.PROXY_AUTODETECT = self.CONFIG.getint('proxy', 'autodetect') if self.CONFIG.has_option('proxy', 'autodetect') else 0
@@ -1500,7 +1511,7 @@ class Common(object):
             info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
         if common.VPS_ENABLE:
             info += 'VPS Listen         : %s\n' % common.VPS_LISTEN
-            info += 'VPS Remote         : %s\n' % common.VPS_REMOTE
+            info += 'VPS Servers        : %s\n' % '|'.join(common.VPS_SERVERS)
         if common.DNS_ENABLE:
             info += 'DNS Listen         : %s\n' % common.DNS_LISTEN
             info += 'DNS Servers        : %s\n' % '|'.join(common.DNS_SERVERS)
@@ -1628,7 +1639,7 @@ def main():
         if common.PHP_ENABLE:
             PHPProxyHandler.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
         if common.VPS_ENABLE:
-            VPSServer.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
+            VPSProxyHandler.net2 = ProxyNet2(common.PROXY_HOST, common.PROXY_PORT, common.PROXY_USERNAME, common.PROXY_PASSWROD)
 
     php_server = None
     if common.PHP_ENABLE:
@@ -1640,12 +1651,12 @@ def main():
     vps_server = None
     if common.VPS_ENABLE:
         host, port = common.VPS_LISTEN.split(':')
-        VPSServer.net2 = AdvancedNet2(window=2, ssl_version='SSLv23', dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
-        VPSServer.net2.enable_connection_cache()
-        VPSServer.net2.enable_connection_keepalive()
-        VPSServer.net2.enable_openssl_session_cache()
-        VPSServer.net2.openssl_context.set_cipher_list('RC4-MD5:RC4-SHA:!aNULL:!eNULL')
-        vps_server = VPSServer((host, int(port)), backlog=1024, remote=common.VPS_REMOTE, password='123456')
+        VPSProxyHandler.net2 = AdvancedNet2(window=2, ssl_version='SSLv23', dns_servers=common.DNS_SERVERS, dns_blacklist=common.DNS_BLACKLIST)
+        VPSProxyHandler.net2.enable_connection_cache()
+        VPSProxyHandler.net2.enable_connection_keepalive()
+        VPSProxyHandler.net2.enable_openssl_session_cache()
+        VPSProxyHandler.net2.openssl_context.set_cipher_list('RC4-MD5:RC4-SHA:!aNULL:!eNULL')
+        vps_server = LocalProxyServer((host, int(port)), VPSProxyHandler)
         thread.start_new_thread(vps_server.serve_forever, tuple())
 
     if common.GAE_ENABLE:
