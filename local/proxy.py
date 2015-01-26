@@ -88,6 +88,7 @@ import urlparse
 import zlib
 import select
 import hmac
+import hashlib
 
 import gevent
 import gevent.server
@@ -791,7 +792,7 @@ class VPSFetchPlugin(BaseFetchPlugin):
     def __init__(self, servers):
         BaseFetchPlugin.__init__(self)
         ServerTuple = collections.namedtuple('server', 'mode password host port')
-        self.servers = []
+        self.servers = {}
         for server in servers:
             mode, password, _, hostport = urllib2._parse_proxy(server)
             assert mode in ('tcp', 'http', 'https', 'dtls')
@@ -802,7 +803,7 @@ class VPSFetchPlugin(BaseFetchPlugin):
             else:
                 host = hostport
                 port = {'tcp': 3389, 'http': 80, 'https':443, 'dtls': 443}[mode]
-            self.servers.append(ServerTuple(mode=mode, password=password, host=host, port=port))
+            self.servers[(host, port)] = ServerTuple(mode=mode, password=password, host=host, port=port)
 
     def handle(self, handler, **kwargs):
         if handler.command == 'CONNECT':
@@ -810,8 +811,8 @@ class VPSFetchPlugin(BaseFetchPlugin):
         else:
             self.handle_method(handler, **kwargs)
 
-    def _new_server_connection(self):
-        def create_connection(ipaddr, timeout, queobj):
+    def _create_server_connection(self, timeout):
+        def create_connection(ipaddr, queobj):
             sock = None
             sock = None
             try:
@@ -831,46 +832,35 @@ class VPSFetchPlugin(BaseFetchPlugin):
                 sock = queobj.get()
                 if sock and hasattr(sock, 'getpeername'):
                     sock.close()
-
-        addresses = [(x, port) for x in self.iplist_alias.get(self.getaliasbyname('%s:%d' % (hostname, port))) or self.gethostsbyname(hostname)]
-        #logging.info('gethostsbyname(%r) return %d addresses', hostname, len(addresses))
         sock = None
-        for i in range(kwargs.get('max_retry', 4)):
-            reorg_ipaddrs()
-            window = self.max_window + i
-            if len(self.ssl_connection_good_ipaddrs) > len(self.ssl_connection_bad_ipaddrs):
-                window = max(2, window-2)
-            if len(self.tcp_connection_bad_ipaddrs)/2 >= len(self.tcp_connection_good_ipaddrs) <= 1.5 * window:
-                window += 2
-            good_ipaddrs = [x for x in addresses if x in self.tcp_connection_good_ipaddrs]
-            good_ipaddrs = sorted(good_ipaddrs, key=self.tcp_connection_time.get)[:window]
-            unknown_ipaddrs = [x for x in addresses if x not in self.tcp_connection_good_ipaddrs and x not in self.tcp_connection_bad_ipaddrs]
-            random.shuffle(unknown_ipaddrs)
-            unknown_ipaddrs = unknown_ipaddrs[:window]
-            bad_ipaddrs = [x for x in addresses if x in self.tcp_connection_bad_ipaddrs]
-            bad_ipaddrs = sorted(bad_ipaddrs, key=self.tcp_connection_bad_ipaddrs.get)[:window]
-            addrs = good_ipaddrs + unknown_ipaddrs + bad_ipaddrs
-            remain_window = 3 * window - len(addrs)
-            if 0 < remain_window <= len(addresses):
-                addrs += random.sample(addresses, remain_window)
-            logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
+        for i in range(kwargs.get('max_retry', 2)):
             queobj = Queue.Queue()
+            addrs = [(x.host, x.port) for x in self.servers.values()]
             for addr in addrs:
-                thread.start_new_thread(create_connection, (addr, timeout, queobj))
+                thread.start_new_thread(create_connection, (addr, queobj))
             for i in range(len(addrs)):
                 sock = queobj.get()
                 if hasattr(sock, 'getpeername'):
-                    spawn_later(0.01, close_connection, len(addrs)-i-1, queobj, getattr(sock, 'tcp_time') or self.tcp_connection_time[sock.getpeername()])
+                    spawn_later(0.01, close_connection, len(addrs)-i-1, queobj)
                     return sock
                 elif i == 0:
                     # only output first error
-                    logging.warning('create_tcp_connection to %r with %s return %r, try again.', hostname, addrs, sock)
+                    logging.warning('_create_server_connection to %r with %s return %r, try again.', hostname, addrs, sock)
         if not hasattr(sock, 'getpeername'):
             raise sock
 
     def handle_connect(self, handler, **kwargs):
-        # sock = handler.create_connection((
-        pass
+        host, port = handler.host, handler.port
+        sock = self._create_server_connection(8)
+        server = self.servers[sock.getpeername()]
+        assert server.mode == 'tcp', 'please use tcp mode'
+        seed = os.urandom(int(hashlib.md5(server.password).hexdigest(), 16) % 11)
+        digest = hmac.new(self.password, seed).digest()
+        csock = RC4Socket(sock, digest)
+        data = chr(len(host)) + host + struct.pack('>H', len(port)) + '\x00'
+        csock.send(data)
+        handler.connection.send('HTTP/1.1 200 OK\r\n\r\n')
+        forward_socket(csock, handler.connection)
 
     def handle_method(self, handler, **kwargs):
         method = handler.command

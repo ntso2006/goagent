@@ -148,7 +148,7 @@ class TCPServer(gevent.server.StreamServer):
         return buf
 
     def handle(self, sock, address):
-        seed = self.readn(sock, 4)
+        seed = self.readn(sock, int(hashlib.md5(self.password).hexdigest(), 16) % 11)
         digest = hmac.new(self.password, seed).digest()
         csock = RC4Socket(sock, digest)
         domain = self.readn(csock, ord(self.readn(csock, 1)))
