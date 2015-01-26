@@ -788,11 +788,91 @@ class PHPProxyHandler(SimpleProxyHandler):
 class VPSFetchPlugin(BaseFetchPlugin):
     """vps fetch plugin"""
 
-    def __init__(self, fetchservers):
+    def __init__(self, servers):
         BaseFetchPlugin.__init__(self)
-        self.fetchservers = fetchservers
+        ServerTuple = collections.namedtuple('server', 'mode password host port')
+        self.servers = []
+        for server in servers:
+            mode, password, _, hostport = urllib2._parse_proxy(server)
+            assert mode in ('tcp', 'http', 'https', 'dtls')
+            m = re.match(r'^(.+):(\d+)$', hostport)
+            if m:
+                host = m.group(1)
+                port = int(m.group(2))
+            else:
+                host = hostport
+                port = {'tcp': 3389, 'http': 80, 'https':443, 'dtls': 443}[mode]
+            self.servers.append(ServerTuple(mode=mode, password=password, host=host, port=port))
 
     def handle(self, handler, **kwargs):
+        if handler.command == 'CONNECT':
+            self.handle_connect(handler, **kwargs)
+        else:
+            self.handle_method(handler, **kwargs)
+
+    def _new_server_connection(self):
+        def create_connection(ipaddr, timeout, queobj):
+            sock = None
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET if ':' not in ipaddr[0] else socket.AF_INET6)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32*1024)
+                sock.settimeout(time)
+                sock.connect(ipaddr)
+                queobj.put(sock)
+            except (socket.error, ssl.SSLError, OSError) as e:
+                queobj.put(e)
+                if sock:
+                    sock.close()
+        def close_connection(count, queobj):
+            for _ in range(count):
+                sock = queobj.get()
+                if sock and hasattr(sock, 'getpeername'):
+                    sock.close()
+
+        addresses = [(x, port) for x in self.iplist_alias.get(self.getaliasbyname('%s:%d' % (hostname, port))) or self.gethostsbyname(hostname)]
+        #logging.info('gethostsbyname(%r) return %d addresses', hostname, len(addresses))
+        sock = None
+        for i in range(kwargs.get('max_retry', 4)):
+            reorg_ipaddrs()
+            window = self.max_window + i
+            if len(self.ssl_connection_good_ipaddrs) > len(self.ssl_connection_bad_ipaddrs):
+                window = max(2, window-2)
+            if len(self.tcp_connection_bad_ipaddrs)/2 >= len(self.tcp_connection_good_ipaddrs) <= 1.5 * window:
+                window += 2
+            good_ipaddrs = [x for x in addresses if x in self.tcp_connection_good_ipaddrs]
+            good_ipaddrs = sorted(good_ipaddrs, key=self.tcp_connection_time.get)[:window]
+            unknown_ipaddrs = [x for x in addresses if x not in self.tcp_connection_good_ipaddrs and x not in self.tcp_connection_bad_ipaddrs]
+            random.shuffle(unknown_ipaddrs)
+            unknown_ipaddrs = unknown_ipaddrs[:window]
+            bad_ipaddrs = [x for x in addresses if x in self.tcp_connection_bad_ipaddrs]
+            bad_ipaddrs = sorted(bad_ipaddrs, key=self.tcp_connection_bad_ipaddrs.get)[:window]
+            addrs = good_ipaddrs + unknown_ipaddrs + bad_ipaddrs
+            remain_window = 3 * window - len(addrs)
+            if 0 < remain_window <= len(addresses):
+                addrs += random.sample(addresses, remain_window)
+            logging.debug('%s good_ipaddrs=%d, unknown_ipaddrs=%r, bad_ipaddrs=%r', cache_key, len(good_ipaddrs), len(unknown_ipaddrs), len(bad_ipaddrs))
+            queobj = Queue.Queue()
+            for addr in addrs:
+                thread.start_new_thread(create_connection, (addr, timeout, queobj))
+            for i in range(len(addrs)):
+                sock = queobj.get()
+                if hasattr(sock, 'getpeername'):
+                    spawn_later(0.01, close_connection, len(addrs)-i-1, queobj, getattr(sock, 'tcp_time') or self.tcp_connection_time[sock.getpeername()])
+                    return sock
+                elif i == 0:
+                    # only output first error
+                    logging.warning('create_tcp_connection to %r with %s return %r, try again.', hostname, addrs, sock)
+        if not hasattr(sock, 'getpeername'):
+            raise sock
+
+    def handle_connect(self, handler, **kwargs):
+        # sock = handler.create_connection((
+        pass
+
+    def handle_method(self, handler, **kwargs):
         method = handler.command
         url = handler.path
         headers = dict((k.title(), v) for k, v in handler.headers.items())
@@ -1656,6 +1736,7 @@ def main():
         VPSProxyHandler.net2.enable_connection_keepalive()
         VPSProxyHandler.net2.enable_openssl_session_cache()
         VPSProxyHandler.net2.openssl_context.set_cipher_list('RC4-MD5:RC4-SHA:!aNULL:!eNULL')
+        VPSProxyHandler.handler_plugins['vps'] = VPSFetchPlugin(common.VPS_SERVERS)
         vps_server = LocalProxyServer((host, int(port)), VPSProxyHandler)
         thread.start_new_thread(vps_server.serve_forever, tuple())
 

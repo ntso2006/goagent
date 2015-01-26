@@ -33,36 +33,6 @@ import gevent
 import gevent.server
 
 
-try:
-    from Crypto.Cipher.ARC4 import new as RC4Cipher
-except ImportError:
-    logging.warn('Load Crypto.Cipher.ARC4 Failed, Use Pure Python Instead.')
-    class RC4Cipher(object):
-        def __init__(self, key):
-            x = 0
-            box = range(256)
-            for i, y in enumerate(box):
-                x = (x + y + ord(key[i % len(key)])) & 0xff
-                box[i], box[x] = box[x], y
-            self.__box = box
-            self.__x = 0
-            self.__y = 0
-        def encrypt(self, data):
-            out = []
-            out_append = out.append
-            x = self.__x
-            y = self.__y
-            box = self.__box
-            for char in data:
-                x = (x + 1) & 0xff
-                y = (y + box[x]) & 0xff
-                box[x], box[y] = box[y], box[x]
-                out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
-            self.__x = x
-            self.__y = y
-            return ''.join(out)
-
-
 class CipherFileObject(object):
     """fileobj wrapper for cipher"""
     def __init__(self, fileobj, cipher, mode='r'):
@@ -87,6 +57,7 @@ class CipherFileObject(object):
 class RC4Socket(object):
     """socket wrapper for cipher"""
     def __init__(self, sock, key):
+        from Crypto.Cipher.ARC4 import new as RC4Cipher
         self.__sock = sock
         self.__key = key
         self.__recv_cipher = RC4Cipher(key)
@@ -102,8 +73,6 @@ class RC4Socket(object):
 
     def send(self, data, flags=0):
         return data and self.__sock.send(self.__send_cipher.encrypt(data), flags)
-
-    sendall = send
 
     def dup(self):
         return RC4Socket(self.__sock.dup(), self.__key)
